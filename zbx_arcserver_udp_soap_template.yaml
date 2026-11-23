@@ -1,0 +1,653 @@
+zabbix_export:
+  version: '7.0'
+  template_groups:
+    - uuid: 0da78927d6ac48dd813d008a19d707a0
+      name: Templates
+  templates:
+    - uuid: f34bac09e9b24298a21e34259c82028b
+      template: 'Arcserve UDP by SOAP'
+      name: 'Arcserve UDP by SOAP'
+      description: |
+        Monitoracao do Arcserve UDP direto na API SOAP (UDPService), sem PowerShell no agente.
+        O item master (tipo Script) roda no Zabbix server/proxy e faz: login -> getNodeList (paginado) -> logout.
+        O getNodeList ja traz, por node, o status do ultimo backup e os ultimos jobs (lstJobHistory),
+        entao NAO e feita uma chamada de historico por node.
+        Observacoes da API: o cookie EDGEJSESSIONID vem com Path=/management e e reenviado manualmente;
+        as datas "UTC" vem com o offset do fuso do servidor (ex.: -03:00) colado, por isso usamos so os digitos ({$ARCSERVEUDP.DATES.ARE.UTC}=1).
+        Requisito: o server/proxy precisa alcancar {$ARCSERVEUDP.HOST}:{$ARCSERVEUDP.PORT}.
+      groups:
+        - name: Templates
+      items:
+        - uuid: e48b457c479a4180a66a7f1e7506a156
+          name: 'Arcserve UDP: Get nodes and last jobs (SOAP)'
+          type: SCRIPT
+          key: arcserveudp.get
+          delay: '{$ARCSERVEUDP.INTERVAL}'
+          history: 1d
+          value_type: TEXT
+          trends: '0'
+          timeout: '{$ARCSERVEUDP.TIMEOUT}'
+          parameters:
+            - name: host
+              value: '{$ARCSERVEUDP.HOST}'
+            - name: port
+              value: '{$ARCSERVEUDP.PORT}'
+            - name: user
+              value: '{$ARCSERVEUDP_USER}'
+            - name: pass
+              value: '{$ARCSERVEUDP_PASS}'
+            - name: domain
+              value: '{$ARCSERVEUDP_DOMAIN}'
+            - name: page_size
+              value: '{$ARCSERVEUDP.PAGE.SIZE}'
+            - name: count_hours
+              value: '{$ARCSERVEUDP.COUNT.HOURS}'
+            - name: dates_are_utc
+              value: '{$ARCSERVEUDP.DATES.ARE.UTC}'
+            - name: status_ok
+              value: '{$ARCSERVEUDP.STATUS.OK}'
+            - name: status_failed
+              value: '{$ARCSERVEUDP.STATUS.FAILED}'
+          params: |
+            // Arcserve UDP - coleta via getNodeList (1 chamada traz status/ultimos jobs de todos os nodes)
+            var p = JSON.parse(value);
+            var URL = 'https://' + p.host + ':' + p.port + '/services/UDPService';
+            var PAGE = parseInt(p.page_size, 10) || 200;
+            var CNT_H = parseInt(p.count_hours, 10) || 24;
+            var OK_RE = new RegExp(p.status_ok || '^(Finished|Incomplete)$');
+            var FAIL_RE = new RegExp(p.status_failed || '^(Failed|Crash|LicenseFailed|BackupJob_PROC_EXIT)$');
+            var RUNNING = { Active: 1, Waiting: 1, Idle: 1 };
+            var now = Date.now();
+            var cookie = '';
+
+            function esc(s) {
+                return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+            }
+            function unesc(s) {
+                return s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+            }
+
+            function soap(op, inner) {
+                var req = new HttpRequest();
+                req.addHeader('Content-Type: text/xml; charset=utf-8');
+                req.addHeader('SOAPAction: ""');
+                // O servidor manda o EDGEJSESSIONID com Path=/management; reenviamos manualmente para /services
+                if (cookie) req.addHeader('Cookie: ' + cookie);
+                var env = '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ws="http://webservice.edge.arcserve.ca.com/">'
+                    + '<soapenv:Body><ws:' + op + '>' + inner + '</ws:' + op + '></soapenv:Body></soapenv:Envelope>';
+                var body = req.post(URL, env);
+                var st = req.getStatus();
+                var f = /<faultstring>([\s\S]*?)<\/faultstring>/.exec(body || '');
+                if (st !== 200 || f) throw op + ' failed: HTTP ' + st + (f ? ' - ' + f[1] : '');
+                var h = req.getHeaders(true) || {};
+                for (var k in h) {
+                    if (k.toLowerCase() === 'set-cookie') {
+                        var arr = [].concat(h[k]), parts = [];
+                        for (var i = 0; i < arr.length; i++) parts.push(String(arr[i]).split(';')[0]);
+                        if (parts.length) cookie = parts.join('; ');
+                    }
+                }
+                return body;
+            }
+
+            // XML -> objeto (sem atributos; elementos repetidos viram array)
+            function parseXml(s) {
+                var re = /<(\/?)(?:[\w.\-]+:)?([\w.\-]+)[^>]*?(\/?)>|([^<]+)/g, m;
+                var root = {}, stack = [{ o: root, t: '', kids: false }];
+                function put(parent, name, val) {
+                    if (parent.o.hasOwnProperty(name)) {
+                        if (!(parent.o[name] instanceof Array)) parent.o[name] = [parent.o[name]];
+                        parent.o[name].push(val);
+                    } else parent.o[name] = val;
+                    parent.kids = true;
+                }
+                while ((m = re.exec(s)) !== null) {
+                    if (m[4] !== undefined) { stack[stack.length - 1].t += m[4]; continue; }
+                    if (m[1] === '/') {
+                        var cur = stack.pop();
+                        put(stack[stack.length - 1], m[2], cur.kids ? cur.o : unesc(cur.t));
+                    } else if (m[3] === '/') {
+                        put(stack[stack.length - 1], m[2], '');
+                    } else {
+                        stack.push({ o: {}, t: '', kids: false });
+                    }
+                }
+                return root;
+            }
+            function list(x) { return x === undefined || x === '' ? [] : (x instanceof Array ? x : [x]); }
+            function find(o, name) {
+                if (!o || typeof o !== 'object') return undefined;
+                if (o.hasOwnProperty(name)) return o[name];
+                for (var k in o) { var r = find(o[k], name); if (r !== undefined) return r; }
+                return undefined;
+            }
+            // O UDP manda o horario UTC com o offset do fuso do servidor (ex.: -03:00) colado: usamos so os digitos, como UTC.
+            function ts(s) {
+                if (!s) return 0;
+                if (p.dates_are_utc !== '1') { var d = Date.parse(s); return isNaN(d) ? 0 : Math.floor(d / 1000); }
+                var m = /^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)/.exec(s);
+                return m ? Math.floor(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) / 1000) : 0;
+            }
+
+            var raw = [];
+            soap('login', '<username>' + esc(p.user) + '</username><password>' + esc(p.pass) + '</password><domain>' + esc(p.domain || '') + '</domain>');
+            try {
+                for (var pg = 0; pg < 50; pg++) {
+                    var ret = find(parseXml(soap('getNodeList', '<pagingConfig><orderCol>hostname</orderCol><orderType>ASC</orderType>'
+                        + '<pagesize>' + PAGE + '</pagesize><startpos>' + (pg * PAGE) + '</startpos></pagingConfig>')), 'return') || {};
+                    var data = list(ret.data);
+                    raw = raw.concat(data);
+                    var total = parseInt(ret.totalCount, 10);
+                    if (data.length < PAGE || (!isNaN(total) && raw.length >= total)) break;
+                }
+            } finally {
+                try { soap('logout', ''); } catch (e) { }
+            }
+
+            var cntLimit = Math.floor(now / 1000) - CNT_H * 3600;
+            var c = { nodes: 0, running: 0, last_ok: 0, last_failed: 0, last_other: 0, never: 0,
+                      jobs_failed: 0, jobs_finished: 0, jobs_incomplete: 0, jobs_canceled: 0, jobs_missed: 0, jobs_total: 0 };
+            var nodes = [], seen = {};
+
+            for (var i = 0; i < raw.length; i++) {
+                var n = raw[i];
+                if (!n || !n.id || seen[n.id]) continue;
+                seen[n.id] = 1;
+                // historico embutido: ordena do mais novo para o mais velho
+                var hist = list(n.lstJobHistory).slice(0).sort(function (a, b) { return ts(b.jobUTCStartDate) - ts(a.jobUTCStartDate); });
+                var last = null, lastOk = 0, jobIds = {};
+                for (var j = 0; j < hist.length; j++) {
+                    var h = hist[j], st = h.jobStatus || '', s = ts(h.jobUTCStartDate);
+                    if (!last && !RUNNING[st]) last = h;
+                    if (!lastOk && OK_RE.test(st)) lastOk = s;
+                    if (s >= cntLimit && !jobIds[h.jobId] && !RUNNING[st]) {
+                        jobIds[h.jobId] = 1;
+                        c.jobs_total++;
+                        if (FAIL_RE.test(st)) c.jobs_failed++;
+                        else if (st === 'Finished') c.jobs_finished++;
+                        else if (st === 'Incomplete') c.jobs_incomplete++;
+                        else if (st === 'Canceled') c.jobs_canceled++;
+                        else if (st === 'Missed') c.jobs_missed++;
+                    }
+                }
+                // sem historico embutido: cai para os campos d2dLastBackup* (se nao estiver rodando)
+                var status = last ? last.jobStatus : (RUNNING[n.d2dLastBackupJobStatus] ? '' : (n.d2dLastBackupJobStatus || ''));
+                var start = last ? ts(last.jobUTCStartDate) : (status ? ts(n.d2dLastBackupStartTime) : 0);
+                var running = (n.jobRunning === 'true' || RUNNING[n.d2dLastBackupJobStatus]) ? 1 : 0;
+                if (!lastOk && OK_RE.test(status)) lastOk = start;
+
+                c.nodes++;
+                if (running) c.running++;
+                if (!status) c.never++;
+                else if (FAIL_RE.test(status)) c.last_failed++;
+                else if (OK_RE.test(status)) c.last_ok++;
+                else c.last_other++;
+
+                nodes.push({
+                    NODEID: String(n.id),
+                    NODENAME: n.hostname || n.vmName || ('node-' + n.id),
+                    PLANNAME: (n.policyName || '').replace(/^\s+|\s+$/g, ''),
+                    Status: status || 'NoBackup',
+                    JobID: last ? String(last.jobId || '') : '',
+                    Start: start,
+                    End: last ? ts(last.jobUTCEndDate) : 0,
+                    LastOk: lastOk,
+                    Running: running
+                });
+            }
+
+            return JSON.stringify({ collected: Math.floor(now / 1000), counts: c, nodes: nodes });
+          tags:
+            - tag: Application
+              value: 'Arcserve UDP'
+          triggers:
+            - uuid: 61b164d64c2c4620ac9c30910a179a2b
+              expression: 'nodata(/Arcserve UDP by SOAP/arcserveudp.get,{$ARCSERVEUDP.NODATA})=1'
+              name: 'Arcserve UDP: API SOAP sem retorno ha {$ARCSERVEUDP.NODATA}'
+              priority: AVERAGE
+              description: 'Veja o erro do item master em Latest data: credencial, rede ate a porta 8015, certificado ou fault da API.'
+              manual_close: 'YES'
+              tags:
+                - tag: ApplId
+                  value: AUTO
+        - uuid: 5e6c8c79ac324bbd88946df90c26775e
+          name: 'Arcserve UDP: Nodes total'
+          type: DEPENDENT
+          key: arcserveudp.count.nodes
+          delay: '0'
+          history: 30d
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.counts.nodes
+          master_item:
+            key: arcserveudp.get
+          tags:
+            - tag: Application
+              value: 'Arcserve UDP'
+        - uuid: 433ecc9efe8d4e3f908000a1732ff2a1
+          name: 'Arcserve UDP: Nodes with job running'
+          type: DEPENDENT
+          key: arcserveudp.count.running
+          delay: '0'
+          history: 30d
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.counts.running
+          master_item:
+            key: arcserveudp.get
+          tags:
+            - tag: Application
+              value: 'Arcserve UDP'
+        - uuid: 2a7667aedb064139bd9c6fa35073076c
+          name: 'Arcserve UDP: Nodes with last job OK'
+          type: DEPENDENT
+          key: arcserveudp.count.last_ok
+          delay: '0'
+          history: 30d
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.counts.last_ok
+          master_item:
+            key: arcserveudp.get
+          tags:
+            - tag: Application
+              value: 'Arcserve UDP'
+        - uuid: 8a29a6b3d71b4514b9dd87aa2353ecbc
+          name: 'Arcserve UDP: Nodes with last job failed'
+          type: DEPENDENT
+          key: arcserveudp.count.last_failed
+          delay: '0'
+          history: 30d
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.counts.last_failed
+          master_item:
+            key: arcserveudp.get
+          tags:
+            - tag: Application
+              value: 'Arcserve UDP'
+        - uuid: 664bb1f074ce488e9b88d17cd97b839a
+          name: 'Arcserve UDP: Nodes without backup'
+          type: DEPENDENT
+          key: arcserveudp.count.never
+          delay: '0'
+          history: 30d
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.counts.never
+          master_item:
+            key: arcserveudp.get
+          tags:
+            - tag: Application
+              value: 'Arcserve UDP'
+        - uuid: 0f16eb4fd6a84ba7a431df4681fa524c
+          name: 'Arcserve UDP: Jobs (last {$ARCSERVEUDP.COUNT.HOURS}h)'
+          type: DEPENDENT
+          key: arcserveudp.count.jobs_total
+          delay: '0'
+          history: 30d
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.counts.jobs_total
+          master_item:
+            key: arcserveudp.get
+          tags:
+            - tag: Application
+              value: 'Arcserve UDP'
+        - uuid: 4219ff6c20f44cdbb9f213b447a53c46
+          name: 'Arcserve UDP: Jobs failed (last {$ARCSERVEUDP.COUNT.HOURS}h)'
+          type: DEPENDENT
+          key: arcserveudp.count.jobs_failed
+          delay: '0'
+          history: 30d
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.counts.jobs_failed
+          master_item:
+            key: arcserveudp.get
+          tags:
+            - tag: Application
+              value: 'Arcserve UDP'
+        - uuid: 052b6c45306c484ab695a45b1765a1ca
+          name: 'Arcserve UDP: Jobs finished (last {$ARCSERVEUDP.COUNT.HOURS}h)'
+          type: DEPENDENT
+          key: arcserveudp.count.jobs_finished
+          delay: '0'
+          history: 30d
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.counts.jobs_finished
+          master_item:
+            key: arcserveudp.get
+          tags:
+            - tag: Application
+              value: 'Arcserve UDP'
+        - uuid: e35bb9f34c9f40279958694ff36c0233
+          name: 'Arcserve UDP: Jobs incomplete (last {$ARCSERVEUDP.COUNT.HOURS}h)'
+          type: DEPENDENT
+          key: arcserveudp.count.jobs_incomplete
+          delay: '0'
+          history: 30d
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.counts.jobs_incomplete
+          master_item:
+            key: arcserveudp.get
+          tags:
+            - tag: Application
+              value: 'Arcserve UDP'
+        - uuid: 9d494326252545bc903cd23c5f0b970e
+          name: 'Arcserve UDP: Jobs canceled (last {$ARCSERVEUDP.COUNT.HOURS}h)'
+          type: DEPENDENT
+          key: arcserveudp.count.jobs_canceled
+          delay: '0'
+          history: 30d
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.counts.jobs_canceled
+          master_item:
+            key: arcserveudp.get
+          tags:
+            - tag: Application
+              value: 'Arcserve UDP'
+        - uuid: bcf47056015c4c2b8aebcb9c29b657f6
+          name: 'Arcserve UDP: Jobs missed (last {$ARCSERVEUDP.COUNT.HOURS}h)'
+          type: DEPENDENT
+          key: arcserveudp.count.jobs_missed
+          delay: '0'
+          history: 30d
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.counts.jobs_missed
+          master_item:
+            key: arcserveudp.get
+          tags:
+            - tag: Application
+              value: 'Arcserve UDP'
+        - uuid: 4e53dc46d98247b7909cceef93b37351
+          name: 'Arcserve UDP: Days until user {$ARCSERVEUDP_USER} expires'
+          key: 'get.domain.user.pwd.exp.days[{$ARCSERVEUDP_USER}]'
+          delay: 24h
+          history: 14d
+          trends: '0'
+          preprocessing:
+            - type: REGEX
+              parameters:
+                - '=\s\"(.*)\"'
+                - \1
+          tags:
+            - tag: Component
+              value: UserBackup
+      discovery_rules:
+        - uuid: d7e28d6c64314536b9aa531cefaacdbf
+          name: 'Arcserve UDP: Node discovery'
+          type: DEPENDENT
+          key: arcserveudp.node.discovery
+          delay: '0'
+          filter:
+            evaltype: AND
+            conditions:
+              - macro: '{#NODENAME}'
+                value: '{$ARCSERVEUDP.NODE.MATCHES}'
+                formulaid: A
+              - macro: '{#NODENAME}'
+                value: '{$ARCSERVEUDP.NODE.NOT_MATCHES}'
+                operator: NOT_MATCHES_REGEX
+                formulaid: B
+              - macro: '{#PLANNAME}'
+                value: '{$ARCSERVEUDP.PLAN.MATCHES}'
+                formulaid: C
+          lifetime_type: DELETE_AFTER
+          lifetime: 7d
+          enabled_lifetime_type: DISABLE_AFTER
+          enabled_lifetime: 1d
+          description: 'Uma entidade por node do Arcserve (estavel), no lugar de uma por JobID.'
+          item_prototypes:
+            - uuid: 1b31effedd9e48dea84cc6a6538dc84c
+              name: 'Arcserve UDP: {#NODENAME}: last job status'
+              type: DEPENDENT
+              key: 'arcserveudp.node.status[{#NODEID}]'
+              delay: '0'
+              history: 7d
+              value_type: CHAR
+              trends: '0'
+              description: 'Status do ultimo job TERMINADO do node (jobs em andamento sao ignorados). NoBackup = node sem backup.'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.nodes[?(@.NODEID==''{#NODEID}'')].Status.first()'
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1h
+              master_item:
+                key: arcserveudp.get
+              tags:
+                - tag: Application
+                  value: 'Arcserve UDP'
+                - tag: Node
+                  value: '{#NODENAME}'
+                - tag: Plan
+                  value: '{#PLANNAME}'
+            - uuid: d2230de2a10c46f4ab8f0de3e26d44bb
+              name: 'Arcserve UDP: {#NODENAME}: last job ID'
+              type: DEPENDENT
+              key: 'arcserveudp.node.jobid[{#NODEID}]'
+              delay: '0'
+              history: 7d
+              value_type: CHAR
+              trends: '0'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.nodes[?(@.NODEID==''{#NODEID}'')].JobID.first()'
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1h
+              master_item:
+                key: arcserveudp.get
+              tags:
+                - tag: Application
+                  value: 'Arcserve UDP'
+                - tag: Node
+                  value: '{#NODENAME}'
+                - tag: Plan
+                  value: '{#PLANNAME}'
+            - uuid: 96cdb5e746ae4795adfbca22a4e22336
+              name: 'Arcserve UDP: {#NODENAME}: last job start'
+              type: DEPENDENT
+              key: 'arcserveudp.node.start[{#NODEID}]'
+              delay: '0'
+              history: 7d
+              units: unixtime
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.nodes[?(@.NODEID==''{#NODEID}'')].Start.first()'
+              master_item:
+                key: arcserveudp.get
+              tags:
+                - tag: Application
+                  value: 'Arcserve UDP'
+                - tag: Node
+                  value: '{#NODENAME}'
+                - tag: Plan
+                  value: '{#PLANNAME}'
+            - uuid: 1b9a2191887b4f4ebfcf2059b93acfef
+              name: 'Arcserve UDP: {#NODENAME}: last OK backup'
+              type: DEPENDENT
+              key: 'arcserveudp.node.lastok[{#NODEID}]'
+              delay: '0'
+              history: 7d
+              units: unixtime
+              description: 'Inicio do ultimo job com status em {$ARCSERVEUDP.STATUS.OK}. 0 = nenhum no historico retornado (~5 jobs).'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.nodes[?(@.NODEID==''{#NODEID}'')].LastOk.first()'
+              master_item:
+                key: arcserveudp.get
+              tags:
+                - tag: Application
+                  value: 'Arcserve UDP'
+                - tag: Node
+                  value: '{#NODENAME}'
+                - tag: Plan
+                  value: '{#PLANNAME}'
+            - uuid: dca3823bb7f04d13b8654a359a65052a
+              name: 'Arcserve UDP: {#NODENAME}: job running'
+              type: DEPENDENT
+              key: 'arcserveudp.node.running[{#NODEID}]'
+              delay: '0'
+              history: 7d
+              description: '1 = ha job rodando agora.'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.nodes[?(@.NODEID==''{#NODEID}'')].Running.first()'
+              master_item:
+                key: arcserveudp.get
+              tags:
+                - tag: Application
+                  value: 'Arcserve UDP'
+                - tag: Node
+                  value: '{#NODENAME}'
+                - tag: Plan
+                  value: '{#PLANNAME}'
+          trigger_prototypes:
+            - uuid: 1e742c3d52f94cb4b0ba001931d80bfa
+              expression: 'find(/Arcserve UDP by SOAP/arcserveudp.node.status[{#NODEID}],,"regexp","{$ARCSERVEUDP.STATUS.FAILED}")=1 and length(last(/Arcserve UDP by SOAP/arcserveudp.node.jobid[{#NODEID}]))>=0 and last(/Arcserve UDP by SOAP/arcserveudp.node.start[{#NODEID}])>=0'
+              name: 'Arcserve UDP: Backup falhou - Node {#NODENAME} Plano {#PLANNAME}'
+              opdata: 'Status: {ITEM.LASTVALUE1} | JobID: {ITEM.LASTVALUE2} | Inicio: {ITEM.LASTVALUE3}'
+              priority: AVERAGE
+              description: 'O ultimo job terminado deste node falhou ({$ARCSERVEUDP.STATUS.FAILED}). Fecha sozinho quando o proximo job terminar sem falha.'
+              manual_close: 'YES'
+              tags:
+                - tag: ApplId
+                  value: TSM
+                - tag: Expire
+                  value: 'True'
+                - tag: InstanceID
+                  value: '{#PLANNAME}'
+                - tag: ResourceId
+                  value: '{#NODENAME}'
+            - uuid: ec997eefd4e3489d983c8adc9512ddba
+              expression: 'find(/Arcserve UDP by SOAP/arcserveudp.node.status[{#NODEID}],,"regexp","{$ARCSERVEUDP.STATUS.WARN}")=1 and length(last(/Arcserve UDP by SOAP/arcserveudp.node.jobid[{#NODEID}]))>=0 and last(/Arcserve UDP by SOAP/arcserveudp.node.start[{#NODEID}])>=0'
+              name: 'Arcserve UDP: Backup com alerta - Node {#NODENAME} Plano {#PLANNAME}'
+              opdata: 'Status: {ITEM.LASTVALUE1} | JobID: {ITEM.LASTVALUE2} | Inicio: {ITEM.LASTVALUE3}'
+              priority: WARNING
+              description: 'Ultimo job terminou como {$ARCSERVEUDP.STATUS.WARN} (Incomplete = terminou mas pulou itens).'
+              manual_close: 'YES'
+              tags:
+                - tag: ApplId
+                  value: TSM
+                - tag: Expire
+                  value: 'True'
+                - tag: InstanceID
+                  value: '{#PLANNAME}'
+                - tag: ResourceId
+                  value: '{#NODENAME}'
+            - uuid: 1ffc500e19384374bd9bbedf735cb7d6
+              expression: '(now()-last(/Arcserve UDP by SOAP/arcserveudp.node.lastok[{#NODEID}]))>{$ARCSERVEUDP.MAX.AGE} and last(/Arcserve UDP by SOAP/arcserveudp.node.running[{#NODEID}])=0'
+              name: 'Arcserve UDP: Sem backup OK ha mais de {$ARCSERVEUDP.MAX.AGE} - Node {#NODENAME}'
+              opdata: 'Ultimo OK: {ITEM.LASTVALUE1}'
+              priority: WARNING
+              description: 'Nenhum job com status {$ARCSERVEUDP.STATUS.OK} dentro de {$ARCSERVEUDP.MAX.AGE} (ou nenhum no historico retornado pela API). Suprimido enquanto ha job rodando ou o alerta de falha estiver ativo.'
+              manual_close: 'YES'
+              dependencies:
+                - name: 'Arcserve UDP: Backup falhou - Node {#NODENAME} Plano {#PLANNAME}'
+                  expression: 'find(/Arcserve UDP by SOAP/arcserveudp.node.status[{#NODEID}],,"regexp","{$ARCSERVEUDP.STATUS.FAILED}")=1 and length(last(/Arcserve UDP by SOAP/arcserveudp.node.jobid[{#NODEID}]))>=0 and last(/Arcserve UDP by SOAP/arcserveudp.node.start[{#NODEID}])>=0'
+              tags:
+                - tag: ApplId
+                  value: TSM
+                - tag: InstanceID
+                  value: '{#PLANNAME}'
+                - tag: ResourceId
+                  value: '{#NODENAME}'
+          master_item:
+            key: arcserveudp.get
+          lld_macro_paths:
+            - lld_macro: '{#NODEID}'
+              path: $.NODEID
+            - lld_macro: '{#NODENAME}'
+              path: $.NODENAME
+            - lld_macro: '{#PLANNAME}'
+              path: $.PLANNAME
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.nodes
+      tags:
+        - tag: Class
+          value: Backup
+        - tag: Component
+          value: ArcServer
+        - tag: ComponentType
+          value: Backup
+        - tag: MonitorStage
+          value: Production
+        - tag: SubComponent
+          value: 'Job Status'
+      macros:
+        - macro: '{$ARCSERVEUDP.COUNT.HOURS}'
+          value: '24'
+          description: 'Janela (horas) dos contadores de jobs.'
+        - macro: '{$ARCSERVEUDP.DATES.ARE.UTC}'
+          value: '1'
+          description: '1 = os digitos das datas "UTC" da API sao UTC e o offset (-03:00) e ignorado (comportamento observado). 0 = respeitar o offset.'
+        - macro: '{$ARCSERVEUDP.HOST}'
+          value: '<ARCSERVE_UDP_CONSOLE_IP_OR_FQDN>'
+          description: 'IP ou FQDN do console do Arcserve UDP (servico UDPService na porta {$ARCSERVEUDP.PORT}).'
+        - macro: '{$ARCSERVEUDP.INTERVAL}'
+          value: '10m'
+        - macro: '{$ARCSERVEUDP.MAX.AGE}'
+          value: '26h'
+          description: 'Alerta se o ultimo backup OK do node for mais antigo que isso. Para excluir nodes, use NODE.NOT_MATCHES.'
+        - macro: '{$ARCSERVEUDP.NODATA}'
+          value: '40m'
+        - macro: '{$ARCSERVEUDP.NODE.MATCHES}'
+          value: '.*'
+          description: 'Regex de nodes a descobrir.'
+        - macro: '{$ARCSERVEUDP.NODE.NOT_MATCHES}'
+          value: 'CHANGE_IF_NEEDED'
+          description: 'Regex de nodes a ignorar.'
+        - macro: '{$ARCSERVEUDP.PAGE.SIZE}'
+          value: '200'
+          description: 'Nodes por pagina do getNodeList.'
+        - macro: '{$ARCSERVEUDP.PLAN.MATCHES}'
+          value: '.+'
+          description: 'Regex do nome do plano. ".+" ignora nodes sem plano; use ".*" para incluir todos.'
+        - macro: '{$ARCSERVEUDP.PORT}'
+          value: '8015'
+        - macro: '{$ARCSERVEUDP.STATUS.FAILED}'
+          value: '^(Failed|Crash|LicenseFailed|BackupJob_PROC_EXIT)$'
+          description: 'Status considerados falha (trigger AVERAGE).'
+        - macro: '{$ARCSERVEUDP.STATUS.OK}'
+          value: '^(Finished|Incomplete)$'
+          description: 'Status que contam como backup OK para o alerta de idade.'
+        - macro: '{$ARCSERVEUDP.STATUS.WARN}'
+          value: '^(Incomplete|Canceled|Missed)$'
+          description: 'Status que geram alerta WARNING. Remova Incomplete se gerar ruido.'
+        - macro: '{$ARCSERVEUDP.TIMEOUT}'
+          value: '90s'
+          description: 'O getNodeList completo levou ~11s no teste.'
+        - macro: '{$ARCSERVEUDP_DOMAIN}'
+          value: '<AD_DOMAIN>'
+          description: 'Dominio do usuario de monitoracao. Deixe vazio para conta local.'
+        - macro: '{$ARCSERVEUDP_PASS}'
+          type: SECRET_TEXT
+          value: '<PASSWORD>'
+          description: 'Senha do usuario de monitoracao (macro secreta).'
+        - macro: '{$ARCSERVEUDP_USER}'
+          value: '<USERNAME>'
+          description: 'Usuario com acesso de leitura ao console do Arcserve UDP.'
